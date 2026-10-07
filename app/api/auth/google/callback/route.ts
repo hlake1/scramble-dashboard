@@ -50,8 +50,8 @@ export async function GET(request: NextRequest) {
   console.log('[OAuth Callback] Attempting token exchange...')
   const tokenResponse = await exchangeCodeForToken(code)
   if (!tokenResponse) {
-    return htmlResponse(
     console.log('[OAuth Callback] Token exchange failed - tokenResponse is null')
+    return htmlResponse(
       '<p>Couldn\'t exchange authorization code for tokens. Close this tab and try again.</p>',
       502
     )
