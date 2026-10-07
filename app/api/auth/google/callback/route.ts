@@ -22,8 +22,12 @@ export async function GET(request: NextRequest) {
   const state = searchParams.get('state') // clientId
   const error = searchParams.get('error')
 
+  console.log('[OAuth Callback] Starting - code:', !!code, 'state:', !!state, 'error:', error)
+  console.log('[OAuth Callback] Env vars - GOOGLE_CLIENT_ID:', !!process.env.GOOGLE_CLIENT_ID, 'GOOGLE_CLIENT_SECRET:', !!process.env.GOOGLE_CLIENT_SECRET, 'NEXT_PUBLIC_APP_URL:', process.env.NEXT_PUBLIC_APP_URL)
+
   // User denied access
   if (error) {
+    console.log('[OAuth Callback] User denied access:', error)
     return htmlResponse(
       `<p>Google sign-in was cancelled: <code>${escapeHtml(error)}</code></p>
        <p><a href="${escapeHtml(process.env.NEXT_PUBLIC_APP_URL || '')}/onboarding">Try again</a></p>`,
@@ -32,6 +36,7 @@ export async function GET(request: NextRequest) {
   }
 
   if (!code || !state) {
+    console.log('[OAuth Callback] Missing code or state')
     return htmlResponse(
       '<p>Missing code or state. Close this tab and click "Connect" again.</p>',
       400
@@ -40,10 +45,13 @@ export async function GET(request: NextRequest) {
 
   const clientId = decodeURIComponent(state)
 
+  console.log('[OAuth Callback] clientId:', clientId)
   // Exchange code for tokens
+  console.log('[OAuth Callback] Attempting token exchange...')
   const tokenResponse = await exchangeCodeForToken(code)
   if (!tokenResponse) {
     return htmlResponse(
+    console.log('[OAuth Callback] Token exchange failed - tokenResponse is null')
       '<p>Couldn\'t exchange authorization code for tokens. Close this tab and try again.</p>',
       502
     )
