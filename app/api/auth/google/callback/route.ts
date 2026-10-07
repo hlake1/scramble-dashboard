@@ -1,21 +1,11 @@
+cat > app/api/auth/google/callback/route.ts << 'EOF'
 import { NextRequest, NextResponse } from 'next/server'
 import { createAdminSupabaseClient } from '@/lib/supabase'
-
-type GoogleProfile = {
-  email: string
-  id: string
-  name: string
-}
 
 /**
  * GET /api/auth/google/callback
  *
- * OAuth callback from Google — follows the Tweak pattern:
- * 1. Validate state parameter
- * 2. Exchange auth code for tokens
- * 3. Get Google profile
- * 4. Store tokens in Supabase (insert only, let unique constraint handle updates)
- * 5. Return HTML confirmation page (not a redirect — keeps tokens server-side)
+ * OAuth callback from Google. Exchanges auth code for tokens and stores them.
  *
  * Query params:
  *   code: string — authorization code from Google
@@ -23,142 +13,142 @@ type GoogleProfile = {
  *   error?: string — if present, OAuth was denied
  */
 export async function GET(request: NextRequest) {
-  const { searchParams } = new URL(request.url)
-  const code = searchParams.get('code')
-  const state = searchParams.get('state') // clientId
-  const error = searchParams.get('error')
+  try {
+    const { searchParams } = new URL(request.url)
+    const code = searchParams.get('code')
+    const state = searchParams.get('state') // clientId
+    const error = searchParams.get('error')
 
-  console.log('[OAuth Callback] Starting - code:', !!code, 'state:', !!state, 'error:', error)
-  console.log('[OAuth Callback] Env vars - GOOGLE_CLIENT_ID:', !!process.env.GOOGLE_CLIENT_ID, 'GOOGLE_CLIENT_SECRET:', !!process.env.GOOGLE_CLIENT_SECRET, 'NEXT_PUBLIC_APP_URL:', process.env.NEXT_PUBLIC_APP_URL)
+    console.log('[OAuth callback] Received callback - code present:', !!code, 'state present:', !!state, 'error:', error)
+    console.log('[OAuth callback] Env check - GOOGLE_CLIENT_ID:', !!process.env.GOOGLE_CLIENT_ID, 'GOOGLE_CLIENT_SECRET:', !!process.env.GOOGLE_CLIENT_SECRET)
 
-  // User denied access
-  if (error) {
-    console.log('[OAuth Callback] User denied access:', error)
-    return htmlResponse(
-      `<p>Google sign-in was cancelled: <code>${escapeHtml(error)}</code></p>
-       <p><a href="${escapeHtml(process.env.NEXT_PUBLIC_APP_URL || '')}/onboarding">Try again</a></p>`,
-      200
+    // User denied access
+    if (error) {
+      console.log('[OAuth callback] User denied OAuth:', error)
+      return NextResponse.redirect(
+        `${process.env.NEXT_PUBLIC_APP_URL}/onboarding?oauth_error=${encodeURIComponent(error)}`
+      )
+    }
+
+    if (!code || !state) {
+      console.error('[OAuth callback] Missing code or state - code:', !!code, 'state:', !!state)
+      return NextResponse.redirect(
+        `${process.env.NEXT_PUBLIC_APP_URL}/onboarding?oauth_error=missing_code_or_state`
+      )
+    }
+
+    const clientId = decodeURIComponent(state)
+    console.log('[OAuth callback] Decoded clientId (email):', clientId)
+
+    // Exchange code for tokens
+    console.log('[OAuth callback] Starting token exchange...')
+    const tokenResponse = await exchangeCodeForToken(code)
+    if (!tokenResponse) {
+      console.error('[OAuth callback] Token exchange returned null')
+      return NextResponse.redirect(
+        `${process.env.NEXT_PUBLIC_APP_URL}/onboarding?oauth_error=token_exchange_failed`
+      )
+    }
+
+    console.log('[OAuth callback] Token exchange successful - got access_token and refresh_token')
+    const {
+      access_token,
+      refresh_token,
+      expires_in,
+      scope,
+      id_token,
+    } = tokenResponse
+
+    // Get Google account info. Try the userinfo endpoint first; if that fails,
+    // fall back to decoding the OIDC id_token (which contains email + sub).
+    console.log('[OAuth callback] Fetching Google profile...')
+    let googleProfile = await getGoogleProfile(access_token)
+    if (!googleProfile && id_token) {
+      console.log('[OAuth callback] Userinfo endpoint failed, trying id_token decode...')
+      googleProfile = decodeIdToken(id_token)
+    }
+    if (!googleProfile || !googleProfile.email) {
+      console.error('[OAuth callback] Could not get email from Google profile')
+      return NextResponse.redirect(
+        `${process.env.NEXT_PUBLIC_APP_URL}/onboarding?oauth_error=profile_fetch_failed`
+      )
+    }
+
+    console.log('[OAuth callback] Got Google profile - email:', googleProfile.email, 'id:', googleProfile.id)
+
+    // Store in Supabase
+    console.log('[OAuth callback] Storing tokens in Supabase...')
+    const supabase = createAdminSupabaseClient()
+    const tokenExpiresAt = new Date(Date.now() + expires_in * 1000).toISOString()
+
+    const { error: upsertError } = await supabase
+      .from('google_oauth_connections')
+      .upsert([
+        {
+          client_id: clientId,
+          google_account_email: googleProfile.email,
+          google_account_id: googleProfile.id,
+          access_token,
+          refresh_token,
+          token_expires_at: tokenExpiresAt,
+          granted_scopes: scope,
+          is_active: true,
+          last_used_at: new Date().toISOString(),
+        },
+      ])
+
+    if (upsertError) {
+      console.error('[OAuth callback] Supabase upsert failed:', upsertError)
+      return NextResponse.redirect(
+        `${process.env.NEXT_PUBLIC_APP_URL}/onboarding?oauth_error=db_error`
+      )
+    }
+
+    console.log('[OAuth callback] Successfully stored tokens in database')
+
+    // Mark the client's profile as google_connected (best-effort)
+    console.log('[OAuth callback] Updating user profile to mark google_connected...')
+    await supabase
+      .from('scramble_users')
+      .update({ google_connected: true, updated_at: new Date().toISOString() })
+      .eq('email', clientId)
+
+    // Log success
+    console.log('[OAuth callback] OAuth flow complete - logging audit event')
+    await logAuditEvent(supabase, clientId, 'oauth_connected', {
+      email: googleProfile.email,
+      scopes: scope.split(' '),
+    })
+
+    console.log('[OAuth callback] SUCCESS - redirecting to onboarding with oauth_success')
+    // Redirect back to onboarding with success
+    return NextResponse.redirect(
+      `${process.env.NEXT_PUBLIC_APP_URL}/onboarding?oauth_success=true&email=${encodeURIComponent(clientId)}`
+    )
+  } catch (error) {
+    console.error('[OAuth callback] Unexpected error:', error)
+    return NextResponse.redirect(
+      `${process.env.NEXT_PUBLIC_APP_URL}/onboarding?oauth_error=internal_error`
     )
   }
-
-  if (!code || !state) {
-    console.log('[OAuth Callback] Missing code or state')
-    return htmlResponse(
-      '<p>Missing code or state. Close this tab and click "Connect" again.</p>',
-      400
-    )
-  }
-
-  const clientId = decodeURIComponent(state)
-  console.log('[OAuth Callback] clientId:', clientId)
-
-  // Exchange code for tokens
-  console.log('[OAuth Callback] Attempting token exchange...')
-  const tokenResponse = await exchangeCodeForToken(code)
-  if (!tokenResponse) {
-    console.log('[OAuth Callback] Token exchange failed - tokenResponse is null')
-    return htmlResponse(
-      '<p>Couldn\'t exchange authorization code for tokens. Close this tab and try again.</p>',
-      502
-    )
-  }
-  console.log('[OAuth Callback] Token exchange successful')
-
-  const { access_token, refresh_token, expires_in, scope, id_token } = tokenResponse
-
-  // Get Google profile
-  let googleProfile = await getGoogleProfile(access_token)
-  if (!googleProfile && id_token) {
-    googleProfile = decodeIdToken(id_token)
-  }
-  if (!googleProfile || !googleProfile.email) {
-    return htmlResponse(
-      '<p>Couldn\'t fetch your Google profile. Close this tab and try again.</p>',
-      502
-    )
-  }
-
-  // Store tokens in Supabase
-  console.log('[OAuth Callback] Storing connection for:', googleProfile.email)
-  const supabase = createAdminSupabaseClient()
-  const stored = await storeGoogleConnection(supabase, {
-    clientId,
-    googleEmail: googleProfile.email,
-    googleId: googleProfile.id,
-    accessToken: access_token,
-    refreshToken: refresh_token,
-    expiresIn: expires_in,
-    grantedScopes: scope,
-  })
-
-  if (!stored) {
-    console.log('[OAuth Callback] Failed to store connection')
-    return htmlResponse(
-      '<p>Couldn\'t save your connection. Close this tab and try again.</p>',
-      502
-    )
-  }
-  console.log('[OAuth Callback] Connection stored successfully')
-
-  // Update user profile (best-effort, don't block on it)
-  supabase
-    .from('scramble_users')
-    .update({ google_connected: true, updated_at: new Date().toISOString() })
-    .eq('email', clientId)
-    .catch(() => null)
-
-  // Return HTML confirmation (never redirect away — keeps tokens server-side)
-  return htmlResponse(`
-    <!doctype html><meta charset="utf-8">
-    <body style="font-family:system-ui,sans-serif;max-width:420px;margin:15vh auto;text-align:center;color:#111;">
-      <p style="font-size:2rem;margin:0;">✓</p>
-      <h1 style="font-size:1.25rem;">Connected as ${escapeHtml(googleProfile.email)}</h1>
-      <p style="color:#555;">You can close this tab and go back to Scramble.</p>
-    </body>
-  `, 200)
-}
-
-/**
- * Helper: HTML response (like Tweak's pattern)
- */
-function htmlResponse(body: string, status: number) {
-  return new NextResponse(body, {
-    status,
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
-  })
-}
-
-/**
- * Helper: Escape HTML (prevent XSS)
- */
-function escapeHtml(text: string): string {
-  const map: Record<string, string> = {
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#039;',
-  }
-  return text.replace(/[&<>"']/g, (c) => map[c])
 }
 
 /**
  * Exchange Google authorization code for access + refresh tokens
  */
-async function exchangeCodeForToken(code: string): Promise<any> {
+async function exchangeCodeForToken(code: string) {
   try {
     const clientId = process.env.GOOGLE_CLIENT_ID
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET
     const redirectUri = `${process.env.NEXT_PUBLIC_APP_URL}/api/auth/google/callback`
 
-    console.log('[Token exchange] clientId present:', !!clientId, 'clientSecret present:', !!clientSecret, 'redirectUri:', redirectUri)
+    console.log('[Token exchange] Checking env vars - clientId:', !!clientId, 'clientSecret:', !!clientSecret, 'redirectUri:', redirectUri)
 
     if (!clientId || !clientSecret) {
-      console.error('[Token exchange] Missing Google OAuth env vars - clientId:', !!clientId, 'clientSecret:', !!clientSecret)
-      return null
+      throw new Error('Missing Google OAuth secrets')
     }
 
-    console.log('[Token exchange] Making request to Google...')
+    console.log('[Token exchange] Making POST to oauth2.googleapis.com/token')
     const response = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -172,146 +162,104 @@ async function exchangeCodeForToken(code: string): Promise<any> {
     })
 
     console.log('[Token exchange] Google response status:', response.status)
-    const data = await response.json()
 
     if (!response.ok) {
-      console.error('[Token exchange] Google error status:', response.status, 'error:', data.error, 'description:', data.error_description)
-      return null
+      const errorData = await response.json()
+      console.error('[Token exchange] Google returned error:', response.status, errorData.error, errorData.error_description)
+      throw new Error(`Token exchange failed: ${response.statusText}`)
     }
 
-    console.log('[Token exchange] Success - received tokens')
+    const data = await response.json()
+    console.log('[Token exchange] Got token response - has access_token:', !!data.access_token, 'has refresh_token:', !!data.refresh_token, 'has id_token:', !!data.id_token)
     return data
   } catch (error) {
-    console.error('[Token exchange] Network error:', error)
+    console.error('[Token exchange] Failed:', error)
     return null
   }
 }
 
 /**
- * Fetch Google profile info (email, id) via the OIDC userinfo endpoint
+ * Fetch Google profile info (email, id) via the OIDC userinfo endpoint.
  */
-async function getGoogleProfile(accessToken: string): Promise<GoogleProfile | null> {
+async function getGoogleProfile(accessToken: string) {
   try {
+    console.log('[Profile fetch] Calling openidconnect.googleapis.com/v1/userinfo...')
+    // Use the OpenID Connect userinfo endpoint (works with userinfo.email scope)
     const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
       headers: { Authorization: `Bearer ${accessToken}` },
     })
 
+    console.log('[Profile fetch] Response status:', response.status)
+
     if (!response.ok) {
-      console.error('[Profile fetch] HTTP error:', response.status)
-      return null
+      console.error('[Profile fetch] HTTP error:', response.status, response.statusText)
+      throw new Error(`Profile fetch failed: ${response.statusText}`)
     }
 
     const data = await response.json()
+    console.log('[Profile fetch] Got profile - email:', data.email, 'id:', data.sub || data.id)
     return {
-      email: data.email as string,
-      id: (data.sub || data.id) as string,
-      name: data.name as string,
+      email: data.email,
+      id: data.sub || data.id,
+      name: data.name,
     }
   } catch (error) {
-    console.error('[Profile fetch] Error:', error)
+    console.error('[Google profile fetch]', error)
     return null
   }
 }
 
 /**
- * Decode email + sub from Google OIDC id_token (no signature verification needed
- * because token came directly from Google's token endpoint over HTTPS).
+ * Decode the email + sub from a Google OIDC id_token (JWT) without verifying
+ * the signature. Safe here because the token came directly from Google's
+ * token endpoint over HTTPS in this same request.
  */
-function decodeIdToken(idToken: string): GoogleProfile | null {
+function decodeIdToken(idToken: string) {
   try {
+    console.log('[Decode id_token] Attempting to decode JWT...')
     const payload = idToken.split('.')[1]
-    if (!payload) return null
     const decoded = JSON.parse(
       Buffer.from(payload.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')
     )
+    console.log('[Decode id_token] Success - email:', decoded.email, 'id:', decoded.sub || decoded.email)
     return {
       email: decoded.email as string,
       id: (decoded.sub || decoded.email) as string,
       name: (decoded.name || '') as string,
     }
   } catch (error) {
-    console.error('[Decode id_token] Error:', error)
+    console.error('[decode id_token]', error)
     return null
   }
 }
 
 /**
- * Store Google connection in Supabase using insert + on conflict update pattern
- * (Tweak-inspired: simpler than upsert, no syntax issues)
+ * Log audit event
  */
-async function storeGoogleConnection(
-  supabase: any,
-  params: {
-    clientId: string
-    googleEmail: string
-    googleId: string
-    accessToken: string
-    refreshToken: string
-    expiresIn: number
-    grantedScopes: string
-  }
-): Promise<boolean> {
+async function logAuditEvent(supabase: any, clientId: string, eventType: string, details: any) {
   try {
-    const { clientId, googleEmail, googleId, accessToken, refreshToken, expiresIn, grantedScopes } = params
-    const now = new Date().toISOString()
-    const tokenExpiresAt = new Date(Date.now() + expiresIn * 1000).toISOString()
-
-    // Try insert first (most common path — first connection or update after delete)
-    const { error: insertError, data: insertData } = await supabase
+    console.log('[Audit log] Creating audit event for clientId:', clientId, 'eventType:', eventType)
+    // First get the connection ID
+    const { data: connection } = await supabase
       .from('google_oauth_connections')
-      .insert([
-        {
-          client_id: clientId,
-          google_account_email: googleEmail,
-          google_account_id: googleId,
-          access_token: accessToken,
-          refresh_token: refreshToken,
-          token_expires_at: tokenExpiresAt,
-          granted_scopes: grantedScopes,
-          is_active: true,
-          last_used_at: now,
-          created_at: now,
-          updated_at: now,
-        },
-      ])
-      .select()
+      .select('id')
+      .eq('client_id', clientId)
+      .single()
 
-    if (!insertError && insertData?.length) {
-      console.log('[OAuth] Successfully inserted new connection')
-      return true
+    if (!connection) {
+      console.warn('[Audit log] Connection not found for clientId:', clientId)
+      return
     }
 
-    // If insert failed due to unique constraint (record already exists), update it instead
-    if (insertError?.code === '23505') {
-      console.log('[OAuth] Record exists, updating...')
-      const { error: updateError } = await supabase
-        .from('google_oauth_connections')
-        .update({
-          google_account_email: googleEmail,
-          google_account_id: googleId,
-          access_token: accessToken,
-          refresh_token: refreshToken,
-          token_expires_at: tokenExpiresAt,
-          granted_scopes: grantedScopes,
-          is_active: true,
-          last_used_at: now,
-          updated_at: now,
-        })
-        .eq('client_id', clientId)
-
-      if (updateError) {
-        console.error('[OAuth] Update failed:', updateError)
-        return false
-      }
-      console.log('[OAuth] Successfully updated connection')
-      return true
-    }
-
-    // Other errors
-    console.error('[OAuth] Insert failed:', insertError)
-    return false
+    await supabase.from('google_oauth_audit').insert([
+      {
+        connection_id: connection.id,
+        event_type: eventType,
+        details,
+      },
+    ])
+    console.log('[Audit log] Audit event logged successfully')
   } catch (error) {
-    console.error('[Store connection] Error:', error)
-    return false
+    console.error('[Audit log]', error)
   }
 }
