@@ -135,7 +135,7 @@ function escapeHtml(text: string): string {
 /**
  * Exchange Google authorization code for access + refresh tokens
  */
-async function exchangeCodeForToken(code: string) {
+async function exchangeCodeForToken(code: string): Promise<any | null> {
   try {
     const clientId = process.env.GOOGLE_CLIENT_ID
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET
@@ -174,7 +174,7 @@ async function exchangeCodeForToken(code: string) {
 /**
  * Fetch Google profile info (email, id) via the OIDC userinfo endpoint
  */
-async function getGoogleProfile(accessToken: string) {
+async function getGoogleProfile(accessToken: string): Promise<{ email: string; id: string; name: string } | null> {
   try {
     const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
       headers: { Authorization: `Bearer ${accessToken}` },
@@ -201,7 +201,7 @@ async function getGoogleProfile(accessToken: string) {
  * Decode email + sub from Google OIDC id_token (no signature verification needed
  * because token came directly from Google's token endpoint over HTTPS).
  */
-function decodeIdToken(idToken: string) {
+function decodeIdToken(idToken: string): { email: string; id: string; name: string } | null {
   try {
     const payload = idToken.split('.')[1]
     if (!payload) return null
@@ -234,7 +234,7 @@ async function storeGoogleConnection(
     expiresIn: number
     grantedScopes: string
   }
-) {
+): Promise<boolean> {
   try {
     const { clientId, googleEmail, googleId, accessToken, refreshToken, expiresIn, grantedScopes } = params
     const now = new Date().toISOString()
