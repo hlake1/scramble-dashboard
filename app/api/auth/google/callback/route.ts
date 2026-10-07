@@ -79,9 +79,7 @@ export async function GET(request: NextRequest) {
           is_active: true,
           last_used_at: new Date().toISOString(),
         },
-      ], {
-        onConflict: 'client_id,google_account_id',
-      })
+      ])
 
     if (upsertError) {
       console.error('[OAuth callback] Supabase upsert failed:', upsertError)
