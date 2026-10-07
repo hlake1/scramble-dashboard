@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createAdminSupabaseClient } from '@/lib/supabase'
 
+type GoogleProfile = {
+  email: string
+  id: string
+  name: string
+}
+
 /**
  * GET /api/auth/google/callback
  *
@@ -44,8 +50,8 @@ export async function GET(request: NextRequest) {
   }
 
   const clientId = decodeURIComponent(state)
-
   console.log('[OAuth Callback] clientId:', clientId)
+
   // Exchange code for tokens
   console.log('[OAuth Callback] Attempting token exchange...')
   const tokenResponse = await exchangeCodeForToken(code)
@@ -56,6 +62,7 @@ export async function GET(request: NextRequest) {
       502
     )
   }
+  console.log('[OAuth Callback] Token exchange successful')
 
   const { access_token, refresh_token, expires_in, scope, id_token } = tokenResponse
 
@@ -72,6 +79,7 @@ export async function GET(request: NextRequest) {
   }
 
   // Store tokens in Supabase
+  console.log('[OAuth Callback] Storing connection for:', googleProfile.email)
   const supabase = createAdminSupabaseClient()
   const stored = await storeGoogleConnection(supabase, {
     clientId,
@@ -84,11 +92,13 @@ export async function GET(request: NextRequest) {
   })
 
   if (!stored) {
+    console.log('[OAuth Callback] Failed to store connection')
     return htmlResponse(
       '<p>Couldn\'t save your connection. Close this tab and try again.</p>',
       502
     )
   }
+  console.log('[OAuth Callback] Connection stored successfully')
 
   // Update user profile (best-effort, don't block on it)
   supabase
@@ -135,17 +145,20 @@ function escapeHtml(text: string): string {
 /**
  * Exchange Google authorization code for access + refresh tokens
  */
-async function exchangeCodeForToken(code: string): Promise<any | null> {
+async function exchangeCodeForToken(code: string): Promise<any> {
   try {
     const clientId = process.env.GOOGLE_CLIENT_ID
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET
     const redirectUri = `${process.env.NEXT_PUBLIC_APP_URL}/api/auth/google/callback`
 
+    console.log('[Token exchange] clientId present:', !!clientId, 'clientSecret present:', !!clientSecret, 'redirectUri:', redirectUri)
+
     if (!clientId || !clientSecret) {
-      console.error('[Token exchange] Missing Google OAuth env vars')
+      console.error('[Token exchange] Missing Google OAuth env vars - clientId:', !!clientId, 'clientSecret:', !!clientSecret)
       return null
     }
 
+    console.log('[Token exchange] Making request to Google...')
     const response = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -158,12 +171,15 @@ async function exchangeCodeForToken(code: string): Promise<any | null> {
       }).toString(),
     })
 
+    console.log('[Token exchange] Google response status:', response.status)
     const data = await response.json()
+
     if (!response.ok) {
-      console.error('[Token exchange] Google error:', data.error, data.error_description)
+      console.error('[Token exchange] Google error status:', response.status, 'error:', data.error, 'description:', data.error_description)
       return null
     }
 
+    console.log('[Token exchange] Success - received tokens')
     return data
   } catch (error) {
     console.error('[Token exchange] Network error:', error)
@@ -174,7 +190,7 @@ async function exchangeCodeForToken(code: string): Promise<any | null> {
 /**
  * Fetch Google profile info (email, id) via the OIDC userinfo endpoint
  */
-async function getGoogleProfile(accessToken: string): Promise<{ email: string; id: string; name: string } | null> {
+async function getGoogleProfile(accessToken: string): Promise<GoogleProfile | null> {
   try {
     const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
       headers: { Authorization: `Bearer ${accessToken}` },
@@ -201,7 +217,7 @@ async function getGoogleProfile(accessToken: string): Promise<{ email: string; i
  * Decode email + sub from Google OIDC id_token (no signature verification needed
  * because token came directly from Google's token endpoint over HTTPS).
  */
-function decodeIdToken(idToken: string): { email: string; id: string; name: string } | null {
+function decodeIdToken(idToken: string): GoogleProfile | null {
   try {
     const payload = idToken.split('.')[1]
     if (!payload) return null
